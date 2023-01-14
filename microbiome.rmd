@@ -36,7 +36,9 @@ sapply(c(.cran_packages, .bioc_packages), require, character.only = TRUE)
 ## Input data
 ```{r input_data}
 set.seed(1234) # make sure the random sampling data could be replicated in each time
+wd_path <- "/Users/hsieh/Microbiome"
 miseq_path <- "/Users/hsieh/Microbiome/Data/MiSeq_SOP"
+meta <- "MIMARKS_Data_combined.csv"
 list.files(miseq_path)
 ```
 
@@ -82,12 +84,100 @@ head(out)
 ## Infer sequence variants
 The basic idea of 16S rRNA sequence analysis is to compare the differences of 16S rRNA sequence between each sample and assign a taxonomy name to the sample. However, errors occurred during sequencing process could wrongly give the sample different taxonomy name. Therefore, we should first calculate the error rate among the whole experiments and set the threshold for excluding sequences with too many errors.
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+### Dereplication
+```{r dereplication}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sampleNames
+names(derepRs) <- sampleNames
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+### Learn error rates (Learn from forward and reverse separately)
+```{r learn_err}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+### Plot the error rates
+```{r plot}
+plotErrors(errF)
+plotErrors(errR)
+```
+### Denoise
+The DADA2 sequence inference method can run in two different modes: Independent inference by sample (pool=FALSE), and inference from the pooled sequencing reads from all samples (pool=TRUE). Independent inference has the advantage that computation time is linear in the number of samples, and memory requirements are flat with the number of samples. This allows scaling out to datasets of almost unlimited size. Pooled inference is more computationally taxing, and can become intractable for datasets of tens of millions of reads. However, pooling improves the detection of rare variants that were seen just once or twice in an individual sample but many times across all samples. As this dataset is not particularly large, we perform pooled inference. As of version 1.2, multithreading can now be activated with the arguments multithread = TRUE, which substantially speeds this step.
+```{r denoise}
+# When data amount becomes large, don't pool sample and use independent inference
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+# The final output
+dadaFs[[1]]
+```
+
+## Construct sequence table and remove chimeras
+### Construct sequence table
+```{r merge_pairs}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs) # Combine F+R reads and count
+seqtabAll <- makeSequenceTable(mergers[!grepl("Mock", names(mergers))]) # Generate Sequence-sample count matrix
+table(nchar(getSequences(seqtabAll)))
+```
+
+### Remove chimeras
+```{r remove_chimeras}
+seqtabNoC <- removeBimeraDenovo(seqtabAll)
+```
+
+## Assign Toxonomy
+The classifier first take the training data set and develop a model to classify our target data set. We use [rdp_train_set_16.fa.gz](https://zenodo.org/record/801828#.Y8JOEOzMLt0) as our training set. Sequences with 97% identity to the target Toxonomy are assigned to it.
+```{r training}
+fastaRef <- file.path(wd_path,"./rdp_train_set_16.fa.gz")
+taxTab <- assignTaxonomy(seqtabNoC, refFasta = fastaRef, multithread=TRUE)
+unname(head(taxTab))
+```
+
+## Constuct phylogenetic tree
+### Perform multiple pair-wise alignments
+```{r pairwise_alignment}
+# Perform pair-wise alignment
+seqs <- getSequences(seqtabNoC)
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE)
+```
+
+### Construct tree
+```{r construct_tree}
+# Construct phylogenetic tree
+phangAlign <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phangAlign)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+        rearrangement = "stochastic", control = pml.control(trace = 0))
+detach("package:phangorn", unload=TRUE)
+```
+
+### Combine meta data with tree
+Get [Meta data](https://raw.githubusercontent.com/spholmes/F1000_workflow/master/data/MIMARKS_Data_combined.csv).
+```{r combine_meta_tree}
+# Read and clean the meta data
+samdf <- read.csv(file.path(wd_path,meta),header=TRUE)
+samdf$SampleID <- paste0(gsub("00", "", samdf$host_subject_id), "D", samdf$age-21)
+samdf <- samdf[!duplicated(samdf$SampleID),] # Remove dupicate entries for reverse reads
+rownames(seqtabAll) <- gsub("124", "125", rownames(seqtabAll)) # Fix discrepancy
+all(rownames(seqtabAll) %in% samdf$SampleID) # TRUE
+
+rownames(samdf) <- samdf$SampleID
+keep.cols <- c("collection_date", "biome", "target_gene", "target_subfragment",
+"host_common_name", "host_subject_id", "age", "sex", "body_product", "tot_mass",
+"diet", "family_relationship", "genotype", "SampleID") 
+samdf <- samdf[rownames(seqtabAll), keep.cols]
+
+# Combine the meta data with phylogenetic tree as well as sequence
+ps <- phyloseq(otu_table(seqtabNoC, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxTab),phy_tree(fitGTR$tree))
+ps <- prune_samples(sample_names(ps) != "Mock", ps) # Remove mock sample
+ps
+```
