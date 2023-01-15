@@ -319,3 +319,29 @@ Another example
 psOrd = subset_taxa(ps3ra, Order == "Lactobacillales")
 plot_abundance(psOrd, Facet = "Genus", Color = NULL)
 ```
+
+## Multivariate projection
+### Install more packages
+```{r packages, echo=FALSE}
+.cran_packages <- c( "shiny","miniUI", "caret", "pls", "e1071", "ggplot2", "randomForest", "dplyr", "ggrepel", "nlme", "devtools",
+                  "reshape2", "PMA", "structSSI", "ade4",
+                  "ggnetwork", "intergraph", "scales")
+.github_packages <- c("jfukuyama/phyloseqGraphTest")
+.bioc_packages <- c("genefilter", "impute")
+# Install CRAN packages (if not already installed)
+.inst <- .cran_packages %in% installed.packages()
+if (any(!.inst)){
+  install.packages(.cran_packages[!.inst],repos = "http://cran.rstudio.com/")
+}
+.inst <- .github_packages %in% installed.packages()
+if (any(!.inst)){
+  devtools::install_github(.github_packages[!.inst])
+}
+
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)){
+  source("http://bioconductor.org/biocLite.R")
+  biocLite(.bioc_packages[!.inst])
+}
+```
+
